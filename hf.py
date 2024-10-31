@@ -10,14 +10,14 @@ from tqdm import tqdm
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-class HuggingFaceModelsFetcher:
+class HuggingFaceStatsFetcher:
     """处理 Hugging Face 模型 API 的分页请求、缓存和统计"""
 
     def __init__(self,
-                 base_url: str = "https://huggingface.co/api/models",
+                 base_url: str = "https://huggingface.co/api",
+                 data_type: str = "models",
                  auth_token: Optional[str] = None,
                  rate_limit: float = 1.0,
-                 cache_file: str = "huggingface_models_cache.json",
                  cache_expiry_hours: int = 24,
                  max_retries: int = 3,
                  backoff_factor: float = 0.5,
@@ -35,12 +35,13 @@ class HuggingFaceModelsFetcher:
             backoff_factor: 重试延迟的指数因子
             retry_status_codes: 需要重试的HTTP状态码列表
         """
-        self.base_url = base_url
+        self.base_url = f"{base_url}/{data_type}"
         self.headers = {}
+        self.data_type = data_type
         if auth_token:
             self.headers["Authorization"] = f"Bearer {auth_token}"
         self.rate_limit = rate_limit
-        self.cache_file = cache_file
+        self.cache_file = f"huggingface_{self.data_type}_cache.json",
         self.cache_expiry_hours = cache_expiry_hours
 
         # 配置重试机制
@@ -140,22 +141,22 @@ class HuggingFaceModelsFetcher:
 
         return next_url, total_pages
 
-    def fetch_all_models(self) -> Generator[Dict[str, Any], None, None]:
+    def fetch_all_data(self) -> Generator[Dict[str, Any], None, None]:
         """获取所有模型信息的生成器"""
         # 首先尝试从缓存加载
         cached_data = self._load_cache()
         if cached_data is not None:
-            for model in cached_data:
-                yield model
+            for data in cached_data:
+                yield data
             return
 
         # 如果没有有效缓存，则从API获取
-        all_models = []
+        all_data = []
         next_url = self.base_url
         current_page = 1
         total_pages = None
         start_time = time.time()
-        models_processed = 0
+        data_processed = 0
 
         # 首次请求以获取总页数
         try:
@@ -169,18 +170,18 @@ class HuggingFaceModelsFetcher:
                 print("警告: 无法获取总页数，将显示简化的进度信息")
 
             # 处理第一页数据
-            first_page_models = response.json()
-            all_models.extend(first_page_models)
-            models_processed += len(first_page_models)
+            first_page_data = response.json()
+            all_data.extend(first_page_data)
+            data_processed += len(first_page_data)
 
             if total_pages:
                 progress_bar.update(1)
                 progress_bar.set_postfix({
-                    'models': models_processed,
-                    'avg_models/page': f"{models_processed/current_page:.1f}"
+                    'models': data_processed,
+                    'avg_models/page': f"{data_processed/current_page:.1f}"
                 })
 
-            for model in first_page_models:
+            for model in first_page_data:
                 yield model
 
         except requests.RequestException as e:
@@ -196,19 +197,19 @@ class HuggingFaceModelsFetcher:
 
                 # 获取当前页的模型数据
                 models = response.json()
-                all_models.extend(models)
+                all_data.extend(models)
                 models_in_page = len(models)
-                models_processed += models_in_page
+                data_processed += models_in_page
 
                 # 更新进度
                 if total_pages:
                     progress_bar.update(1)
                     progress_bar.set_postfix({
-                        'models': models_processed,
-                        'avg_models/page': f"{models_processed/current_page:.1f}"
+                        'models': data_processed,
+                        'avg_models/page': f"{data_processed/current_page:.1f}"
                     })
                 else:
-                    print(f"处理第 {current_page} 页，已获取 {models_processed} 个模型")
+                    print(f"处理第 {current_page} 页，已获取 {data_processed} 个模型")
 
                 # 产出当前页的模型数据
                 for model in models:
@@ -229,14 +230,14 @@ class HuggingFaceModelsFetcher:
             progress_bar.close()
 
         # 保存到缓存
-        self._save_cache(all_models)
+        self._save_cache(all_data)
 
         # 打印最终统计信息
         elapsed_time = time.time() - start_time
         print(f"\n获取完成:")
         print(f"- 总页数: {current_page}")
-        print(f"- 总模型数: {models_processed}")
-        print(f"- 平均每页模型数: {models_processed/current_page:.1f}")
+        print(f"- 总模型数: {data_processed}")
+        print(f"- 平均每页模型数: {data_processed/current_page:.1f}")
         print(f"- 总耗时: {elapsed_time:.1f}秒")
         print(f"- 平均每页耗时: {elapsed_time/current_page:.1f}秒")
 
@@ -247,7 +248,7 @@ class HuggingFaceModelsFetcher:
 
         print("开始统计2024年月度数据...")
 
-        for model in self.fetch_all_models():
+        for model in self.fetch_all_data():
             processed_count += 1
 
             # 获取模型创建时间
@@ -294,10 +295,10 @@ def print_monthly_stats(stats: Dict[str, Dict[str, Any]]):
 def main():
     """主函数示例"""
     # 初始化获取器
-    fetcher = HuggingFaceModelsFetcher(
+    fetcher = HuggingFaceStatsFetcher(
         auth_token="YOUR_TOKEN_HERE",  # 替换为你的 token
+        data_type="models",
         rate_limit=1.0,  # 每次请求间隔1秒
-        cache_file="huggingface_models_cache.json",  # 缓存文件路径
         cache_expiry_hours=24,  # 缓存24小时有效
         max_retries=3,  # 最大重试3次
         backoff_factor=0.5,  # 重试延迟的指数因子
@@ -325,4 +326,5 @@ def main():
         print(f"获取模型时发生错误: {str(e)}")
 
 if __name__ == "__main__":
+
     main()
