@@ -29,10 +29,15 @@ while True:
     data = response.json()
     
     # 如果已经到最后一页,退出循环
-    if not data["Data"]:
+    try:
+        if not data["Data"]:
+            break
+    except:
         break
     
     # 添加当前页的模型数据
+    if len(data["Data"]["Model"]["Models"]) == 0:
+        break
     all_models.extend(data["Data"]["Model"]["Models"])
     
     # 更新页码
@@ -44,20 +49,8 @@ while True:
 
 print("已完成模型信息爬取,正在统计数据...")
 
-# 统计每个月新增的模型数量
-monthly_counts = {}
-for model in all_models:
-    created_at = datetime.strptime(model["CreatedAt"], "%Y-%m-%dT%H:%M:%S.%fZ")
-    month_year = created_at.strftime("%Y-%m")
-    if month_year not in monthly_counts:
-        monthly_counts[month_year] = 0
-    monthly_counts[month_year] += 1
-
 # 保存原始数据到JSON文件
 with open("modelscope_models.json", "w") as f:
     json.dump(all_models, f, indent=4)
 
-print("数据统计完成,结果如下:")
-for month_year, count in monthly_counts.items():
-    print(f"{month_year}: {count}")
 print("原始数据已保存到 modelscope_models.json 文件。")
