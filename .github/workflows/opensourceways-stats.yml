@@ -8,6 +8,8 @@ on:
 jobs:
   get_year:
     runs-on: ubuntu-latest
+    outputs:
+      year: ${{ steps.get_year.outputs.year }}
     steps:
       - name: Get Current Year
         id: get_year
