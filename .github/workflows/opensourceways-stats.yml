@@ -11,12 +11,11 @@ jobs:
     steps:
       - name: Get Current Year
         id: get_year
-        run: echo "year=$(date +%Y)" >> $GITHUB_STATE
+        run: echo "year=$(date +%Y)" >> $GITHUB_OUTPUT
   call_repo_stats_core:
       needs: get_year
-      - name: Call Repo Stats Core Workflow
-        uses: ./.github/workflows/repo-stats-core.yml
-        with:
-          org:  'opensourceways' # 设置默认组织
-          end_year: ${{ needs.get_year.outputs.year }} # 传递计算得到的年份
-        secrets: inherit
+      uses: ./.github/workflows/repo-stats-core.yml
+      with:
+        org:  'opensourceways' # 设置默认组织
+        end_year: ${{ needs.get_year.outputs.year }} # 传递计算得到的年份
+      secrets: inherit
