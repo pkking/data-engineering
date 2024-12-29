@@ -10,5 +10,3 @@ jobs:
     uses: ./.github/workflows/repo-stats-core.yml
     with:
       org: opensourceways # 使用输入或默认组织
-    secrets:
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

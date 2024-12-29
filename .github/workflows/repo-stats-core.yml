@@ -11,9 +11,7 @@ on:
         required: false
         type: number
         default: ${{ now().split('T')[0].split('-')[0] }}
-    secrets:
-      GITHUB_TOKEN:
-        required: true
+
 jobs:
   get_repo_stats:
     runs-on: ubuntu-latest
