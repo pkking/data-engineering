@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 import pygit2
 from tqdm.asyncio import tqdm
 import urllib.parse  # 正确导入 urllib.parse
+import re  # 正确导入 re 模块
 
 # 配置日志，输出到 stdout
 logging.basicConfig(
@@ -20,6 +21,12 @@ logging.basicConfig(
     stream=sys.stdout  # 指定输出流为 stdout
 )
 logger = logging.getLogger(__name__)
+
+# 获取最大并发数，默认为 20
+MAX_CONCURRENCY = int(os.environ.get("MAX_CONCURRENCY", "20"))
+# 创建信号量
+semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
+logger.info(f"最大并发数为: {MAX_CONCURRENCY}")
 
 async def get_my_username(session, token):
     """通过 API 获取 token 持有者的用户名。"""
@@ -135,11 +142,12 @@ async def get_lines_of_code_local(repo_path):
         logger.error(f"cloc 输出 JSON 解析失败：{e}")
         return None
     
-async def async_clone_repo(repo_url, repo_path):
-    """异步克隆仓库。"""
+async def async_run_git_command(repo_path, *command):
+    """异步执行 git 命令。"""
     try:
         process = await asyncio.create_subprocess_exec(
-            "git", "clone", repo_url, repo_path,
+            *command,
+            cwd=repo_path, # 设置工作目录
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
@@ -148,22 +156,115 @@ async def async_clone_repo(repo_url, repo_path):
         if process.returncode != 0:
             if stderr:
                 err_msg = stderr.decode().strip()
-                logger.error(f"克隆仓库 {repo_url} 失败: {err_msg}")
+                logger.error(f"执行 git 命令 {' '.join(command)} 失败: {err_msg}")
             else:
-                logger.error(f"克隆仓库 {repo_url} 失败，返回码: {process.returncode}")
+                logger.error(f"执行 git 命令 {' '.join(command)} 失败，返回码: {process.returncode}")
             return False
         return True
     except asyncio.CancelledError:
-        logger.info(f"克隆仓库 {repo_url} 的任务被取消。")
+        logger.info(f"执行 git 命令 {' '.join(command)} 的任务被取消。")
         return False
     except Exception as e:
-        logger.error(f"克隆仓库 {repo_url} 时发生异常：{e}")
+        logger.error(f"执行 git 命令 {' '.join(command)} 时发生异常：{e}")
         return False
+
+async def async_get_branches(repo_path):
+    """异步获取仓库的所有分支。"""
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "git", "branch", "-a", # 获取所有分支，包括远程分支
+            cwd=repo_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await process.communicate()
+
+        if process.returncode != 0:
+            if stderr:
+                err_msg = stderr.decode().strip()
+                logger.error(f"执行 git branch -a 失败: {err_msg}")
+            else:
+                logger.error(f"执行 git branch -a 失败，返回码: {process.returncode}")
+            return None
+
+        branches = []
+        for line in stdout.decode().splitlines():
+            branch = line.strip()
+            # 过滤掉 HEAD 分支和远程分支的头部信息
+            branch = re.sub(r"^\*\s*", "", branch) # 去除星号和空格
+            branch = re.sub(r"^remotes\/origin\/", "", branch) # 去除 remotes/origin/
+            if branch and not branch.startswith("HEAD"): # 确保不是空字符串且不是 HEAD
+                branches.append(branch)
+        return branches
+    except asyncio.CancelledError:
+        logger.info(f"获取分支的任务被取消。")
+        return None
+    except Exception as e:
+        logger.error(f"获取分支时发生异常：{e}")
+        return None
+
+async def async_clone_repo(repo_url, repo_path):
+    # 使用信号量进行并发控制
+    async with semaphore:
+        if os.path.exists(repo_path) and os.path.isdir(os.path.join(repo_path, ".git")):
+            logger.info(f"仓库 {repo_path} 已存在，执行 fetch 和 checkout。")
+            if not await async_run_git_command(repo_path, "git", "fetch"):
+                return False
+
+            branches = await async_get_branches(repo_path)
+            if branches:
+                if "main" in branches:
+                    branch_to_checkout = "main"
+                elif "master" in branches:
+                    branch_to_checkout = "master"
+                else:
+                    branch_to_checkout = branches[0] if branches else None
+
+                if branch_to_checkout:
+                    if await async_run_git_command(repo_path, "git", "checkout", branch_to_checkout):
+                        logger.info(f"成功 checkout 分支：{branch_to_checkout}")
+                        return True
+                    else:
+                        logger.error(f"checkout 分支 {branch_to_checkout} 失败。")
+                        return False
+                else:
+                    logger.error("没有找到任何分支可以 checkout。")
+                    return False
+            else:
+                logger.error("无法获取分支信息。")
+                return False
+
+        else:
+            logger.info(f"仓库 {repo_path} 不存在，执行 clone。")
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    "git", "clone", repo_url, repo_path,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, stderr = await process.communicate()
+
+                if process.returncode != 0:
+                    if stderr:
+                        err_msg = stderr.decode().strip()
+                        logger.error(f"克隆仓库 {repo_url} 失败: {err_msg}")
+                    else:
+                        logger.error(f"克隆仓库 {repo_url} 失败，返回码: {process.returncode}")
+                    return False
+                return True
+            except asyncio.CancelledError:
+                logger.info(f"克隆仓库 {repo_url} 的任务被取消。")
+                return False
+            except Exception as e:
+                logger.error(f"克隆仓库 {repo_url} 时发生异常：{e}")
+                return False
 
 async def process_repo(session, token, org_name, my_username, repo, all_repo_stats, exclude_repos, end_year):
     """处理单个仓库的统计信息。"""
-    if repo in exclude_repos:
-        logger.info(f"仓库 {org_name}/{repo} 在排除列表中，跳过。")
+    repo_key = f"{org_name}/{repo}" # 生成 repo_key
+
+    if repo_key in exclude_repos:
+        logger.info(f"仓库 {repo_key} 在排除列表中，跳过。") # 使用 repo_key
         return
 
     repo_path = None  # 在 try 块外部初始化 repo_path
@@ -174,13 +275,10 @@ async def process_repo(session, token, org_name, my_username, repo, all_repo_sta
             return
 
         encoded_token = urllib.parse.quote(token, safe="")
-        repo_url = f"https://{my_username}:{encoded_token}@github.com/{org_name}/{repo}.git"
-        repo_path = f"{org_name}/{repo}" # 在克隆之前赋值
+        repo_url = f"https://{my_username}:{encoded_token}@github.com/{repo_key}.git"
+        repo_path = f"{repo_key}" # 在克隆之前赋值
 
         try:
-            if os.path.exists(repo_path):
-                shutil.rmtree(repo_path)
-
             clone_success = await async_clone_repo(repo_url, repo_path) # 异步克隆
             if not clone_success: # 克隆失败直接返回
                 return
@@ -192,35 +290,34 @@ async def process_repo(session, token, org_name, my_username, repo, all_repo_sta
         for year in range(creation_year, end_year + 1):
             latest_commit_sha = await get_latest_commit_sha(session, token, org_name, repo, year)
             if not latest_commit_sha:
-                logger.warning(f"无法获取仓库 {org_name}/{repo} {year} 年的最新 commit SHA。")
+                logger.warning(f"无法获取仓库 {repo_key} {year} 年的最新 commit SHA。")
                 continue
 
-            if repo not in all_repo_stats:
-                all_repo_stats[repo] = {'stats': {}}
+            if repo_key not in all_repo_stats:
+                all_repo_stats[repo_key] = {'stats': {}}
 
-            if str(year) in all_repo_stats[repo]['stats'] and all_repo_stats[repo]['stats'][str(year)].get('latest_commit_sha') == latest_commit_sha:
-                logger.info(f"仓库 {org_name}/{repo} {year} 年没有更新，跳过。")
+            if str(year) in all_repo_stats[repo]['stats'] and all_repo_stats[repo_key]['stats'][str(year)].get('latest_commit_sha') == latest_commit_sha:
+                logger.info(f"仓库 {repo_key} {year} 年没有更新，跳过。")
                 continue
 
             commits_count = await get_commits_count_local(repo_path, year)
             lines_of_code = await get_lines_of_code_local(repo_path)
 
             if commits_count is not None and lines_of_code is not None:
-                all_repo_stats[repo]['stats'][str(year)] = {
+                all_repo_stats[repo_key] = { # 使用 repo_key 作为 key
                     "latest_commit_sha": latest_commit_sha,
                     "lines_of_code": lines_of_code,
                     "commits_count": commits_count
                 }
-                logger.info(f"成功获取仓库 {org_name}/{repo} {year} 年的统计信息，包含 {commits_count} 个提交。")
+                logger.info(f"成功获取仓库 {repo_key} {year} 年的统计信息，包含 {commits_count} 个提交。")
             else:
-                logger.warning(f"获取仓库 {org_name}/{repo} {year} 年统计信息失败")
+                logger.warning(f"无法获取仓库 {repo_key} 的提交数或代码行数。") # 使用 repo_key
 
     except Exception as e:
-        logger.error(f"处理仓库 {org_name}/{repo} 时发生异常：{e}")
+        logger.error(f"处理仓库 {repo_key} 时发生异常：{e}")
         return
     finally:
-        if repo_path and os.path.exists(repo_path): # 检查 repo_path 是否被赋值
-            shutil.rmtree(repo_path)
+        pass
 
 async def main():
     parser = argparse.ArgumentParser(description="统计 GitHub 组织下所有仓库的信息。")
