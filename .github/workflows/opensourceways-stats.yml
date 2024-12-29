@@ -12,7 +12,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v3
       - run: |
-          apt install -y git cloc
+          sudo apt install -y git cloc
 
       - name: Set up Python
         uses: actions/setup-python@v4
