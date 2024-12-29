@@ -9,9 +9,12 @@ jobs:
   call_repo_stats_core:
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
       - name: Get Current Year
         id: get_year
-        run: echo "::set-output name=year::$(date +%Y)"
+        run: echo "year=$(date +%Y)" >> $GITHUB_STATE
+
       - name: Call Repo Stats Core Workflow
         uses: ./.github/workflows/repo-stats-core.yml
         with:
