@@ -1,6 +1,5 @@
 name: GitHub Repo Stats Core
 
-
 on:
   workflow_call:
     inputs:

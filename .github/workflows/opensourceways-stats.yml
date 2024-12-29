@@ -6,17 +6,17 @@ on:
   workflow_dispatch:
 
 jobs:
-  call_repo_stats_core:
+  get_year:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
       - name: Get Current Year
         id: get_year
         run: echo "year=$(date +%Y)" >> $GITHUB_STATE
-
+  call_repo_stats_core:
+      needs: get_year
       - name: Call Repo Stats Core Workflow
         uses: ./.github/workflows/repo-stats-core.yml
         with:
           org:  'opensourceways' # 设置默认组织
-          end_year: ${{ steps.get_year.outputs.year }} # 传递计算得到的年份
+          end_year: ${{ needs.get_year.outputs.year }} # 传递计算得到的年份
+        secrets: inherit
