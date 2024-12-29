@@ -8,9 +8,8 @@ on:
         required: true
         type: string
       end_year:
-        required: false
+        required: true
         type: number
-        default: ${{ now().split('T')[0].split('-')[0] }}
 
 jobs:
   get_repo_stats:

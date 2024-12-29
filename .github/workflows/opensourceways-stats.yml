@@ -7,6 +7,12 @@ on:
 
 jobs:
   call_repo_stats_core:
-    uses: ./.github/workflows/repo-stats-core.yml
-    with:
-      org: opensourceways # 使用输入或默认组织
+    steps:
+      - name: Get Current Year
+        id: get_year
+        run: echo "::set-output name=year::$(date +%Y)"
+      - name: Call Repo Stats Core Workflow
+        uses: ./.github/workflows/repo-stats-core.yml
+        with:
+          org:  'opensourceways' # 设置默认组织
+          end_year: ${{ steps.get_year.outputs.year }} # 传递计算得到的年份
