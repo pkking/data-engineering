@@ -1,0 +1,63 @@
+name: GitHub Repo Stats Core
+
+
+on:
+  workflow_call:
+    inputs:
+      org:
+        required: true
+        type: string
+      end_year:
+        required: false
+        type: number
+        default: ${{ now().split('T')[0].split('-')[0] }}
+    secrets:
+      GITHUB_TOKEN:
+        required: true
+jobs:
+  get_repo_stats:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      - run: |
+          sudo apt install -y git cloc
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12' # 或其他合适的 Python 版本
+
+      - name: Install dependencies
+        run: |
+          pip install aiohttp argparse pygit2 tqdm 
+
+      - name: Cache repos
+        id: cache-repos
+        uses: actions/cache@v3
+        with:
+          path: opensourceways
+          key: opensourceways-repos
+
+      - name: Cache output JSON
+        id: cache-output
+        uses: actions/cache@v3
+        with:
+          path: 'opensourceways_*_stats.json' # 缓存所有 JSON 文件
+          key: opensourceways-output
+
+      - name: Run script
+        env:
+          ORG_NAME: ${{ inputs.org }}
+          MAX_CONCURRENCY: 10 # 根据需要调整并发数
+        run: |
+          python repo-stats.py -t "${{ secrets.GITHUB_TOKEN }}" -o $ORG_NAME
+          ls -l *.json # 列出生成的 JSON 文件
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "GitHub Actions Bot"
+          git config --global user.email "actions@github.com"
+          git add *.json
+          git commit -m "Update repo stats JSON file"
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Update repos stats" && git push)      
