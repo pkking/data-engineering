@@ -8,7 +8,7 @@ on:
         type: string
       end_year:
         required: true
-        type: number
+        type: string
 
 jobs:
   get_repo_stats:
@@ -46,7 +46,7 @@ jobs:
         env:
           MAX_CONCURRENCY: 10 # 根据需要调整并发数
         run: |
-          python repo-stats.py -t "${{ secrets.GITHUB_TOKEN }}" -o ${{ inputs.org }}
+          python repo-stats.py -t "${{ secrets.GITHUB_TOKEN }}" -o ${{ inputs.org }} -y ${{ inputs.end_year }}
           ls -l *.json # 列出生成的 JSON 文件
 
       - name: Configure Git
