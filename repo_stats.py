@@ -11,16 +11,40 @@ import signal
 from datetime import datetime, timezone
 import pygit2
 from tqdm.asyncio import tqdm
-import urllib.parse  # 正确导入 urllib.parse
-import re  # 正确导入 re 模块
+import urllib.parse
+import re
+import asyncio
+import aiohttp
+import json
+import os
+import shutil
+import subprocess
+import logging
+import sys
+import signal
+from datetime import datetime, timezone
+import pygit2
+from tqdm.asyncio import tqdm
+import urllib.parse
 
 # 配置日志，输出到 stdout
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    stream=sys.stdout  # 指定输出流为 stdout
+    stream=sys.stdout
 )
 logger = logging.getLogger(__name__)
+
+# Conventional Commits 正则表达式
+CONVENTIONAL_COMMIT_PATTERN = re.compile(
+    r"^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\(.+\))?: .+$"
+)
+
+def validate_conventional_commit(commit_message):
+    """
+    验证提交信息是否符合 Conventional Commits 标准。
+    """
+    return bool(CONVENTIONAL_COMMIT_PATTERN.match(commit_message.split('\n')[0]))
 
 # 获取最大并发数，默认为 20
 MAX_CONCURRENCY = int(os.environ.get("MAX_CONCURRENCY", "20"))
@@ -141,7 +165,152 @@ async def get_lines_of_code_local(repo_path):
     except json.JSONDecodeError as e:
         logger.error(f"cloc 输出 JSON 解析失败：{e}")
         return None
+
+async def get_contributor_commits_local(repo_path, year):
+    """本地使用 git log 统计指定年份的每个贡献者的 commits 数量。"""
+    try:
+        start_date = f"{year}-01-01"
+        end_date = f"{year+1}-01-01"
+        command = [
+            "git", "log",
+            f"--since={start_date}",
+            f"--until={end_date}",
+            "--pretty=format:%an" # 只输出作者名
+        ]
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            cwd=repo_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await process.communicate()
+
+        if process.returncode != 0:
+            err_msg = stderr.decode().strip()
+            logger.error(f"执行 git log --pretty=format:%an 失败: {err_msg}")
+            return None
+
+        authors = stdout.decode().strip().split('\n')
+        contributor_commits = {}
+        for author in authors:
+            if author: # 避免空行
+                contributor_commits[author] = contributor_commits.get(author, 0) + 1
+        return contributor_commits
+    except asyncio.CancelledError:
+        logger.info(f"获取贡献者提交的任务被取消。")
+        return None
+    except Exception as e:
+        logger.error(f"获取贡献者提交时发生异常：{e}")
+        return None
     
+async def get_all_commits_details_local(repo_path, year):
+    """
+    本地使用 git log 统计指定年份的每个提交的 SHA、作者和完整提交信息。
+    """
+    try:
+        start_date = f"{year}-01-01"
+        end_date = f"{year+1}-01-01"
+        command = [
+            "git", "log",
+            f"--since={start_date}",
+            f"--until={end_date}",
+            "--pretty=format:%H%x00%an%x00%B" # SHA, 作者名, 完整提交信息 (使用空字符分隔)
+        ]
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            cwd=repo_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await process.communicate()
+
+        if process.returncode != 0:
+            err_msg = stderr.decode().strip()
+            logger.error(f"执行 git log 获取提交详情失败: {err_msg}")
+            return None
+
+        commits_raw = stdout.decode().strip().split('\n\n') # 提交之间用两个换行符分隔
+        detailed_commits = []
+        for commit_block in commits_raw:
+            if not commit_block.strip():
+                continue
+            parts = commit_block.split('\x00')
+            if len(parts) >= 3:
+                sha = parts[0].strip()
+                author = parts[1].strip()
+                message = parts[2].strip()
+                detailed_commits.append({
+                    "sha": sha,
+                    "author": author,
+                    "message": message
+                })
+        return detailed_commits
+    except asyncio.CancelledError:
+        logger.info(f"获取提交详情的任务被取消。")
+        return None
+    except Exception as e:
+        logger.error(f"获取提交详情时发生异常：{e}")
+        return None
+
+async def check_pull_request_review(session, token, org_name, repo_name, commit_sha):
+    """
+    检查给定提交是否经过了代码审查（即是否是合并自一个已批准的拉取请求）。
+    """
+    headers = {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+    # 获取与提交关联的拉取请求
+    pulls_url = f"https://api.github.com/repos/{org_name}/{repo_name}/commits/{commit_sha}/pulls"
+    try:
+        async with session.get(pulls_url, headers=headers) as response:
+            response.raise_for_status()
+            pulls_data = await response.json()
+
+            for pull in pulls_data:
+                if pull.get("merged_at"): # 检查是否已合并
+                    # 获取拉取请求的审查列表
+                    reviews_url = pull["_links"]["reviews"]["href"]
+                    async with session.get(reviews_url, headers=headers) as review_response:
+                        review_response.raise_for_status()
+                        reviews_data = await review_response.json()
+                        for review in reviews_data:
+                            if review.get("state") == "APPROVED":
+                                return True # 找到一个已批准的审查
+            return False # 没有找到已合并且已批准的拉取请求
+    except aiohttp.ClientResponseError as e:
+        if e.status == 404:
+            logger.warning(f"未找到提交 {commit_sha} 相关的拉取请求或审查信息。")
+        else:
+            logger.error(f"检查提交 {commit_sha} 的拉取请求审查失败: {e}")
+        return False
+    except aiohttp.ClientError as e:
+        logger.error(f"检查提交 {commit_sha} 的拉取请求审查时发生网络错误: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"检查提交 {commit_sha} 的拉取请求审查时发生未知错误: {e}")
+        return False
+
+async def process_single_commit(session, token, org_name, repo_name, year, commit_data):
+    """
+    处理单个提交，检查其审查状态和提交信息规范性。
+    """
+    commit_sha = commit_data["sha"]
+    commit_message = commit_data["message"]
+
+    is_pr_merged_and_reviewed = await check_pull_request_review(
+        session, token, org_name, repo_name, commit_sha
+    )
+    is_conventional_commit = validate_conventional_commit(commit_message)
+
+    commit_data["is_pr_merged_and_reviewed"] = is_pr_merged_and_reviewed
+    commit_data["is_conventional_commit"] = is_conventional_commit
+    
+    # 添加 repo_name 和 year 到返回数据，以便在 main 函数中重新组织
+    commit_data["repo_name"] = repo_name
+    commit_data["year"] = year
+    return commit_data
+
 async def async_run_git_command(repo_path, *command):
     """异步执行 git 命令。"""
     try:
@@ -186,7 +355,6 @@ async def async_get_branches(repo_path):
             else:
                 logger.error(f"执行 git branch -a 失败，返回码: {process.returncode}")
             return None
-
         branches = []
         for line in stdout.decode().splitlines():
             branch = line.strip()
@@ -259,6 +427,43 @@ async def async_clone_repo(repo_url, repo_path):
                 logger.error(f"克隆仓库 {repo_url} 时发生异常：{e}")
                 return False
 
+async def check_test_files_or_dirs(repo_path):
+    """
+    检查仓库目录中是否存在常见的测试文件或测试目录。
+    """
+    test_dirs = ["tests", "test"]
+    test_file_patterns = [
+        re.compile(r"^test_.*\.py$"),  # Python
+        re.compile(r".*\.test\.js$"),  # JavaScript
+        re.compile(r".*\.spec\.ts$"),  # TypeScript
+        re.compile(r".*\.test\.jsx$"), # React JSX
+        re.compile(r".*\.spec\.tsx$"), # React TSX
+        re.compile(r".*_test\.go$"),   # Go
+        re.compile(r".*\.rs$"),        # Rust (often in src/tests or separate test files)
+        re.compile(r".*\.java$"),      # Java (e.g., JUnit tests)
+        re.compile(r".*\.kt$"),        # Kotlin (e.g., JUnit tests)
+        re.compile(r".*\.php$"),       # PHP (e.g., PHPUnit tests)
+        re.compile(r".*\.rb$"),        # Ruby (e.g., RSpec, Minitest)
+        re.compile(r".*\.cs$"),        # C# (e.g., NUnit, XUnit)
+        re.compile(r".*\.cpp$"),       # C++ (e.g., Google Test)
+        re.compile(r".*\.c$"),         # C (e.g., Unity)
+    ]
+
+    for root, dirs, files in os.walk(repo_path):
+        # 检查测试目录
+        for td in test_dirs:
+            if td in dirs:
+                logger.info(f"在 {repo_path} 中找到测试目录: {os.path.join(root, td)}")
+                return True
+        
+        # 检查测试文件
+        for f in files:
+            for pattern in test_file_patterns:
+                if pattern.match(f):
+                    logger.info(f"在 {repo_path} 中找到测试文件: {os.path.join(root, f)}")
+                    return True
+    return False
+
 async def process_repo(session, token, org_name, my_username, repo, all_repo_stats, exclude_repos, end_year):
     """处理单个仓库的统计信息。"""
     repo_key = f"{org_name}/{repo}" # 生成 repo_key
@@ -283,9 +488,22 @@ async def process_repo(session, token, org_name, my_username, repo, all_repo_sta
             if not clone_success: # 克隆失败直接返回
                 return
 
+            # 调用 check_test_files_or_dirs 函数并存储返回值
+            has_test_files_or_dirs = await check_test_files_or_dirs(repo_path)
+            
+            # 记录日志
+            logger.info(f"仓库 {repo_key} 测试文件/目录存在情况: {has_test_files_or_dirs}")
+
         except Exception as e:
             logger.error(f"克隆仓库 {repo_url} 时发生异常：{e}")
             return
+
+        # 确保 all_repo_stats[repo_key] 字典存在
+        if repo_key not in all_repo_stats:
+            all_repo_stats[repo_key] = {}
+        
+        # 添加 has_test_files_or_dirs 字段到统计结果中
+        all_repo_stats[repo_key]['has_test_files_or_dirs'] = has_test_files_or_dirs
 
         for year in range(creation_year, end_year + 1):
             latest_commit_sha = await get_latest_commit_sha(session, token, org_name, repo, year)
@@ -293,25 +511,33 @@ async def process_repo(session, token, org_name, my_username, repo, all_repo_sta
                 logger.warning(f"无法获取仓库 {repo_key} {year} 年的最新 commit SHA。")
                 continue
 
-            if repo_key not in all_repo_stats:
-                all_repo_stats[repo_key] = {'stats': {}}
+            if 'yearly_stats' not in all_repo_stats[repo_key]:
+                all_repo_stats[repo_key]['yearly_stats'] = {} # 初始化 yearly_stats
 
-            if str(year) in all_repo_stats[repo]['stats'] and all_repo_stats[repo_key]['stats'][str(year)].get('latest_commit_sha') == latest_commit_sha:
+            # 检查是否需要更新
+            current_year_stats = all_repo_stats[repo_key]['yearly_stats'].get(str(year), {})
+            if current_year_stats.get('latest_commit_sha') == latest_commit_sha:
                 logger.info(f"仓库 {repo_key} {year} 年没有更新，跳过。")
                 continue
 
             commits_count = await get_commits_count_local(repo_path, year)
             lines_of_code = await get_lines_of_code_local(repo_path)
+            contributor_commits = await get_contributor_commits_local(repo_path, year) # 获取贡献者提交
 
-            if commits_count is not None and lines_of_code is not None:
-                all_repo_stats[repo_key] = { # 使用 repo_key 作为 key
+            # 新增：获取所有提交的详细信息（SHA, 作者, 消息）
+            all_commits_raw_for_year = await get_all_commits_details_local(repo_path, year)
+
+            if commits_count is not None and lines_of_code is not None and contributor_commits is not None:
+                all_repo_stats[repo_key]['yearly_stats'][str(year)] = {
                     "latest_commit_sha": latest_commit_sha,
                     "lines_of_code": lines_of_code,
-                    "commits_count": commits_count
+                    "commits_count": commits_count,
+                    "contributors": contributor_commits, # 存储贡献者信息
+                    "all_commits_raw": all_commits_raw_for_year if all_commits_raw_for_year else [] # 存储原始提交详情
                 }
                 logger.info(f"成功获取仓库 {repo_key} {year} 年的统计信息，包含 {commits_count} 个提交。")
             else:
-                logger.warning(f"无法获取仓库 {repo_key} 的提交数或代码行数。") # 使用 repo_key
+                logger.warning(f"无法获取仓库 {repo_key} 的提交数、代码行数或贡献者信息。")
 
     except Exception as e:
         logger.error(f"处理仓库 {repo_key} 时发生异常：{e}")
@@ -325,44 +551,68 @@ async def main():
     parser.add_argument("-o", "--org", required=True, help="需要统计的组织名。")
     parser.add_argument("-y", "--year", type=int, help="要统计的年份 (可选)。")
     parser.add_argument("-O", "--output", help="输出 JSON 文件名 (可选)。")
-    parser.add_argument("-e", "--exclude", nargs='+', default=[], help="需要排除的仓库名列表 (可选)。") # 添加 exclude 参数
+    parser.add_argument("-E", "--exclude", nargs='*', default=[], help="需要排除的仓库列表，用空格分隔。")
 
     args = parser.parse_args()
+    github_token = args.token
+    org_name = args.org
+    target_year = args.year
+    output_filename = args.output if args.output else DATA_FILENAME
+    exclude_repos = set(args.exclude) # 将排除列表转换为集合以便快速查找
 
-    end_year = args.year if args.year else datetime.now().year # 如果 year 参数未提供，则使用当前年份
+    all_repo_stats = {}
 
-    async with aiohttp.ClientSession() as session:
-        my_username = await get_my_username(session, args.token)
-        if not my_username:
-            print("无法获取您的用户名，请检查您的 Token 是否有效。")
-            return
-
-        repos = await get_org_repos(session, args.token, args.org)
-        exclude_repos = set(args.exclude)
-
-        DATA_FILENAME = f"{args.org}_{end_year}_stats.json"  # 数据文件名包含截止年份
+    # 尝试从现有文件加载数据
+    if os.path.exists(output_filename):
         try:
-            with open(DATA_FILENAME, "r", encoding="utf-8") as f:
+            with open(output_filename, 'r', encoding='utf-8') as f:
                 all_repo_stats = json.load(f)
-        except FileNotFoundError:
+            logger.info(f"成功从 {output_filename} 加载现有数据。")
+        except json.JSONDecodeError:
+            logger.warning(f"无法解析 {output_filename}，将创建新文件。")
+            all_repo_stats = {}
+        except Exception as e:
+            logger.error(f"加载现有数据时发生错误: {e}")
             all_repo_stats = {}
 
-        tasks = [process_repo(session, args.token, args.org, my_username, repo, all_repo_stats, exclude_repos, end_year) for repo in repos] # 传递 end_year 参数
-        global tasks_to_cancel
-        tasks_to_cancel = tasks
+    async with aiohttp.ClientSession() as session:
+        my_username = await get_my_username(session, github_token)
+        if not my_username:
+            logger.error("无法获取 GitHub 用户名，请检查 token 是否有效。")
+            return
 
-        try:
-            for future in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc=f"正在处理仓库至 {end_year} 年"): # 修改 tqdm 描述
-                try:
-                    await future
-                except asyncio.CancelledError:
-                    logger.info("一个任务被取消。")
-        except asyncio.CancelledError:
-                logger.info("主任务被取消。")
-        finally:
-            with open(DATA_FILENAME, "w", encoding="utf-8") as f:
-                json.dump(all_repo_stats, f, indent=4, ensure_ascii=False)
-            logger.info(f"统计信息已保存到 {DATA_FILENAME}")
+        repos = await get_org_repos(session, github_token, org_name)
+        if not repos:
+            logger.warning(f"组织 {org_name} 下没有找到任何仓库。")
+            return
+
+        logger.info(f"开始处理 {len(repos)} 个仓库...")
+
+        tasks = []
+        current_year = datetime.now(timezone.utc).year
+        end_year = target_year if target_year else current_year
+
+        for repo in repos:
+            tasks.append(process_repo(
+                session, github_token, org_name, my_username, repo, all_repo_stats, exclude_repos, end_year
+            ))
+
+        # 使用 tqdm.asyncio.tqdm 显示进度条
+        for f in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="处理仓库"):
+            await f
+
+    # 将结果保存到 JSON 文件
+    try:
+        with open(output_filename, 'w', encoding='utf-8') as f:
+            json.dump(all_repo_stats, f, ensure_ascii=False, indent=4)
+        logger.info(f"所有仓库统计信息已保存到 {output_filename}")
+    except Exception as e:
+        logger.error(f"保存数据到文件失败：{e}")
+
+def signal_handler(sig, frame):
+    logger.info("接收到中断信号，正在退出...")
+    sys.exit(0)
 
 if __name__ == "__main__":
+    signal.signal(signal.SIGINT, signal_handler)
     asyncio.run(main())
